@@ -1,0 +1,51 @@
+#!/bin/bash
+
+# Arrête le script si une commande échoue
+set -e
+
+# Vérification des privilèges
+if [ "$EUID" -ne 0 ]; then
+  echo "Erreur critique : L'automatisation exige les droits root."
+  exit 1
+fi
+
+# Vérification de l'argument
+if [ -z "$1" ]; then
+  echo "Usage : $0 <nom_utilisateur>"
+  exit 1
+fi
+
+USERNAME=$1
+NAS_ROOT="/mnt/nas_data"
+PRIVATE_DIR="$NAS_ROOT/private/$USERNAME"
+PUBLIC_DIR="$NAS_ROOT/public"
+
+# VÉRIFICATION D'EXISTENCE
+if id "$USERNAME" &>/dev/null; then
+    echo "Opération annulée : L'utilisateur $USERNAME existe déjà sur le système."
+    exit 1
+fi
+
+echo "Début du provisionnement pour le compte NAS : $USERNAME"
+
+# CRÉATION DU COMPTE
+useradd -d "$PRIVATE_DIR" -s /usr/sbin/nologin -G nas_users -m "$USERNAME"
+
+# Root confisque la racine pour satisfaire les exigences SSHD
+chown root:root "$PRIVATE_DIR"
+chmod 755 "$PRIVATE_DIR"
+
+# Création de l'espace privé réel
+mkdir "$PRIVATE_DIR/mes_fichiers"
+chown "$USERNAME:nas_users" "$PRIVATE_DIR/mes_fichiers"
+
+# BIND MOUNT
+mkdir "$PRIVATE_DIR/dossier_public"
+mount --bind "$PUBLIC_DIR" "$PRIVATE_DIR/dossier_public"
+
+# ne crée pas de doublons si le script est relancé
+if ! grep -q "$PRIVATE_DIR/dossier_public" /etc/fstab; then
+    echo "$PUBLIC_DIR $PRIVATE_DIR/dossier_public none bind 0 0" >> /etc/fstab
+fi
+
+echo "Provisionnement terminé. N'oubliez pas de définir le mot de passe avec : passwd $USERNAME"
