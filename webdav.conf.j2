@@ -1,0 +1,27 @@
+<VirtualHost *:443>
+    ServerName 192.168.56.10
+    DocumentRoot /mnt/nas_data/private
+
+    SSLEngine on
+    SSLCertificateFile /etc/ssl/certs/nas-srv.crt
+    SSLCertificateKeyFile /etc/ssl/private/nas-srv.key
+
+    Alias /webdav /mnt/nas_data/private
+
+    <Directory /mnt/nas_data/private>
+        Options Indexes FollowSymLinks
+        AllowOverride None
+        Require all granted
+    </Directory>
+
+    <Location /webdav>
+        DAV On
+        AuthType Basic
+        AuthName "NAS - Chiffrement Actif"
+        AuthUserFile /etc/apache2/webdav.password
+        Require valid-user
+    </Location>
+
+    ErrorLog ${APACHE_LOG_DIR}/webdav_ssl_error.log
+    CustomLog ${APACHE_LOG_DIR}/webdav_ssl_access.log combined
+</VirtualHost>

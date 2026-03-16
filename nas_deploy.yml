@@ -1,0 +1,214 @@
+---
+- name: Deploiement de l'infrastructure NAS
+  hosts: localhost
+  connection: local
+  become: yes
+  vars:
+    raid_disks: "/dev/sdb /dev/sdc /dev/sdd"
+    mount_point: "/mnt/nas_data"
+
+  tasks:
+    - name: 1. Installation de mdadm
+      apt:
+        name: mdadm
+        state: present
+        update_cache: yes
+
+    - name: 2. Creation du RAID 5 (si inexistant)
+      shell: yes | mdadm --create --verbose /dev/md0 --level=5 --raid-devices=3 {{ raid_disks }}
+      args:
+        creates: /dev/md0
+
+    - name: 3. Formatage du volume en ext4
+      filesystem:
+        fstype: ext4
+        dev: /dev/md0
+
+    - name: 4. Extraction de l'UUID securise du RAID
+      command: blkid -s UUID -o value /dev/md0
+      register: raid_uuid
+      changed_when: false
+
+    - name: 5. Creation du point de montage
+      file:
+        path: "{{ mount_point }}"
+        state: directory
+        mode: '0755'
+
+    - name: 6. Montage et inscription fstab par UUID
+      mount:
+        path: "{{ mount_point }}"
+        src: "UUID={{ raid_uuid.stdout }}"
+        fstype: ext4
+        opts: defaults,usrquota,grpquota
+        state: mounted
+
+    - name: 7. Installation des paquets (Apache, htpasswd, Quota)
+      apt:
+        pkg:
+          - apache2
+          - apache2-utils
+          - quota
+        state: present
+
+    - name: 8. Activation des modules Apache (WebDAV & SSL)
+      command: a2enmod dav dav_fs ssl
+      register: mod_status
+      changed_when: "'already enabled' not in mod_status.stdout"
+
+    - name: 9. Creation du groupe maitre nas_users
+      group:
+        name: nas_users
+        state: present
+
+    - name: 10. Autorisation d'ecriture pour le serveur Web
+      user:
+        name: www-data
+        groups: nas_users
+        append: yes
+
+    - name: 11. Redemarrage de synchronisation Apache
+      systemd:
+        name: apache2
+        state: restarted
+
+    - name: 12. Charger la base de donnees des utilisateurs
+      include_vars:
+        file: /vagrant/users.yml
+
+    - name: 13. Creation des comptes systeme NAS
+      user:
+        name: "{{ item }}"
+        shell: /usr/sbin/nologin
+        groups: nas_users
+        home: "/mnt/nas_data/private/{{ item }}"
+        create_home: yes
+        password: "{{ 'password123' | password_hash('sha512') }}"
+      loop: "{{ liste_utilisateurs_nas }}"
+
+    - name: 13.5 Securite - Extinction temporaire des quotas
+      command: quotaoff /mnt/nas_data
+      failed_when: false
+      changed_when: false
+
+    - name: 14. Creation des bases de donnees de quotas
+      command: quotacheck -cugm /mnt/nas_data
+      args:
+        creates: /mnt/nas_data/aquota.group
+
+    - name: 15. Activation du systeme de quotas
+      command: quotaon /mnt/nas_data
+      register: quotaon_result
+      failed_when:
+        - quotaon_result.rc != 0
+        - "'already on' not in quotaon_result.stderr"
+      changed_when: "'already on' not in quotaon_result.stderr"
+
+    - name: 16. Generation des identifiants WebDAV
+      htpasswd:
+        path: /etc/apache2/webdav.password
+        name: "{{ item }}"
+        password: "password123" # A chiffrer avec Vault plus tard
+        owner: root
+        group: www-data
+        mode: 0640
+      loop: "{{ liste_utilisateurs_nas }}"
+
+    - name: 17. Configuration des Quotas
+      command: setquota -u {{ item }} 4000000 5000000 0 0 /mnt/nas_data
+      loop: "{{ liste_utilisateurs_nas }}"
+    
+    - name: 17.5 Generation du certificat SSL auto-signe
+      command: >
+        openssl req -x509 -nodes -days 365 -newkey rsa:2048
+        -keyout /etc/ssl/private/nas-srv.key
+        -out /etc/ssl/certs/nas-srv.crt
+        -subj "/C=FR/ST=PACA/L=Marseille/O=Portfolio/CN=192.168.56.10"
+      args:
+        creates: /etc/ssl/certs/nas-srv.crt
+
+    - name: 18. Deploiement du VirtualHost WebDAV (Template Jinja2)
+      template:
+        src: /vagrant/webdav.conf.j2
+        dest: /etc/apache2/sites-available/webdav.conf
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: 19. Activation du site WebDAV
+      command: a2ensite webdav
+      register: a2ensite_result
+      changed_when: "'already enabled' not in a2ensite_result.stdout"
+
+    - name: 20. Desactivation du site web par defaut
+      command: a2dissite 000-default
+      register: a2dissite_result
+      changed_when: "'already disabled' not in a2dissite_result.stdout"
+
+    - name: 21. Rechargement du moteur Apache
+      systemd:
+        name: apache2
+        state: reloaded
+    
+    - name: 22. Creation du Dossier Public (Espace collaboratif)
+      file:
+        path: /mnt/nas_data/public
+        state: directory
+        owner: root
+        group: nas_users
+        mode: '2775' # Le "2" au debut est le SetGID magique. "775" donne les droits r/w au groupe.
+    
+    - name: 23. Creation de la session Administrateur (Gouvernance)
+      user:
+        name: superviseur_nas
+        groups: sudo, nas_users
+        append: yes
+        shell: /bin/bash
+        # En production, on chiffre avec Ansible Vault.
+        password: "{{ 'admin' | password_hash('sha512') }}"
+    
+    - name: 24. Verrouillage cryptographique des racines (Exigence SSHD)
+      file:
+        path: "/mnt/nas_data/private/{{ item }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+      loop: "{{ liste_utilisateurs_nas }}"
+
+    - name: 25. Creation des espaces d'ecriture personnels
+      file:
+        path: "/mnt/nas_data/private/{{ item }}/mes_fichiers"
+        state: directory
+        owner: "{{ item }}"
+        group: nas_users
+        mode: '0700'
+      loop: "{{ liste_utilisateurs_nas }}"
+
+    - name: 26. Securisation du protocole SFTP (Chroot Jail)
+      blockinfile:
+        path: /etc/ssh/sshd_config
+        marker: "# {mark} ANSIBLE MANAGED BLOCK - SFTP NAS"
+        block: |
+          Match Group nas_users
+              ChrootDirectory /mnt/nas_data/private/%u
+              ForceCommand internal-sftp
+              AllowTcpForwarding no
+              X11Forwarding no
+              PasswordAuthentication yes
+
+    - name: 27. Application des regles SSH
+      systemd:
+        name: ssh
+        state: restarted
+    
+    - name: 28. Installation de l'interface de gestion (Cockpit)
+      apt:
+        name: cockpit
+        state: present
+
+    - name: 29. Activation du service Cockpit
+      systemd:
+        name: cockpit.socket
+        state: started
+        enabled: yes
